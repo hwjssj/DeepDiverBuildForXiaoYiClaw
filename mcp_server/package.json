@@ -1,0 +1,15 @@
+{
+  "name": "deepdiver-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for DeepDiver Build API — create tasks, check progress, get preview URLs",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "inspect": "npx @modelcontextprotocol/inspector node index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.2",
+    "zod": "^3.24.3"
+  }
+}
