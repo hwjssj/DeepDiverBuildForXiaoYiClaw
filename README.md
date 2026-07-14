@@ -12,9 +12,15 @@
 │   └── package.json
 │
 ├── skills/              # Claude Code Skills
-│   ├── SKILL.md         # DeepDiver Task Manager Skill
-│   └── scripts/         # Skill 配套脚本
-│       └── create-task.js
+│   └── deepdiver/
+│       └── SKILL.md     # DeepDiver Task Manager Skill（MCP 驱动）
+│
+├── scripts/             # CLI 工具脚本
+│   ├── auth.js
+│   ├── create-task.js
+│   ├── list-projects.js
+│   ├── get-preview.js
+│   └── listen-task.js
 │
 └── docs/                # DeepDiver API 文档
     ├── deepdiver-api.md
@@ -91,47 +97,16 @@ npm run inspect        # MCP Inspector 调试界面
 
 ## Skill 使用
 
-需要一个 Skill 来管理构建任务并轮询进度。
+详见 [`skills/deepdiver/SKILL.md`](skills/deepdiver/SKILL.md)。
 
-### 前置条件
+核心流程通过 MCP 工具完成，无需手动执行脚本：
 
-```bash
-export DEEPDIVER_EMAIL="your@email.com"
-export DEEPDIVER_PASSWORD="your_password"
-# 或直接提供 token
-export DEEPDIVER_TOKEN="<jwt>"
-```
+1. **登录** — 调用 `ddb_login`（首次）
+2. **创建任务** — 调用 `ddb_create_task`，传入 `prompt`
+3. **轮询进度** — 调用 `ddb_check_progress`，传入 `workspace_id`
+4. **获取预览** — 调用 `ddb_get_preview`，传入 `workspace_id`
 
-### 创建任务
-
-```bash
-node skills/scripts/create-task.js -p "<任务描述>"
-```
-
-输出中包含 `WORKSPACE_ID`，后续轮询进度使用。
-
-### 轮询进度
-
-按以下顺序检查：
-
-1. **文件生成** — `GET /api/files/${WORKSPACE_ID}?path=&max_depth=3`
-2. **开发服务器** — `GET /api/dev-server-status?session_id=${WORKSPACE_ID}`
-3. **构建队列** — `GET /api/projects` → `building_workspace_ids`
-
-或使用脚本：
-
-```bash
-node skills/scripts/list-projects.js
-```
-
-### 状态解读
-
-| 现象 | 进展 |
-|------|------|
-| `building_workspace_ids` 包含该 ID | AI 正在构建中 |
-| 文件列表开始出现 | AI 已开始生成代码 |
-| 开发服务器 `running: true` | 代码已生成，预览就绪 |
-| `building_workspace_ids` 不再包含 | 构建完成 |
+根目录 `scripts/` 下的 CLI 脚本为降级备用方案，日常使用推荐走 MCP。
 
 ## 文档
 
