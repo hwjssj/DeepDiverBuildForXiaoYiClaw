@@ -11,7 +11,7 @@
 │   ├── lib/api.js       # DeepDiver REST API 客户端
 │   └── package.json
 │
-├── skills/              # Claude Code Skills
+├── skills/              # Agent Skills
 │   └── deepdiver/
 │       └── SKILL.md     # DeepDiver Task Manager Skill（MCP 驱动）
 │
