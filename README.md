@@ -1,6 +1,6 @@
 # DeepDiver Build — XiaoYi Claw 工具集
 
-构建和预览 DeepDiver 应用的 CLI 工具、MCP 服务器和 Claude Skill。
+构建和预览 DeepDiver 应用的 CLI 工具、MCP 服务器和  Skill。
 
 ## 项目结构
 
@@ -33,22 +33,26 @@
 
 ### 提供工具
 
-| 工具 | 说明 |
-|------|------|
-| `ddb_login` | 登录并保存 JWT token |
-| `ddb_create_task` | 创建构建任务（创建项目 + WebSocket 发送 prompt） |
-| `ddb_check_progress` | 检查任务进度（文件、服务、构建状态） |
-| `ddb_get_preview` | 获取预览 URL（自动启动 dev server） |
-| `ddb_list_projects` | 列出所有项目及构建状态 |
+
+| 工具                   | 说明                                 |
+| -------------------- | ---------------------------------- |
+| `ddb_login`          | 登录并保存 JWT token                    |
+| `ddb_create_task`    | 创建构建任务（创建项目 + WebSocket 发送 prompt） |
+| `ddb_check_progress` | 检查任务进度（文件、服务、构建状态）                 |
+| `ddb_get_preview`    | 获取预览 URL（自动启动 dev server）          |
+| `ddb_list_projects`  | 列出所有项目及构建状态                        |
+
 
 ### 环境变量
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `DEEPDIVER_BASE_URL` | API 地址 | `https://cn.deepdiver.app` |
-| `DEEPDIVER_MODEL` | 构建用模型 ID | `ddexp` |
-| `DEEPDIVER_TOKEN` | JWT token（最高优先级） | — |
-| `DEEPDIVER_TOKEN_FILE` | token 文件路径 | `.deepdiver-token` |
+
+| 变量                     | 说明               | 默认值                        |
+| ---------------------- | ---------------- | -------------------------- |
+| `DEEPDIVER_BASE_URL`   | API 地址           | `https://cn.deepdiver.app` |
+| `DEEPDIVER_MODEL`      | 构建用模型 ID         | `ddexp`                    |
+| `DEEPDIVER_TOKEN`      | JWT token（最高优先级） | —                          |
+| `DEEPDIVER_TOKEN_FILE` | token 文件路径       | `.deepdiver-token`         |
+
 
 ### 配置到 AI 客户端
 
