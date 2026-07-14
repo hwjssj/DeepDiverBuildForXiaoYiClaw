@@ -1,3 +1,4 @@
 ._*
 .deepdiver-token
 node_modules/
+.cache/
