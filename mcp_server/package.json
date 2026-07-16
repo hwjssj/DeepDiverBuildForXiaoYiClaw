@@ -1,7 +1,10 @@
 {
   "name": "deepdiver-mcp",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "description": "MCP server for DeepDiver Build API — create tasks, check progress, get preview URLs",
+  "engines": {
+    "node": ">=21.2.0"
+  },
   "type": "module",
   "main": "index.js",
   "scripts": {

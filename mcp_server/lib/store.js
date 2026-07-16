@@ -43,6 +43,7 @@ export function loadTasks() {
     return JSON.parse(raw);
   } catch (err) {
     if (err.code === 'ENOENT') return [];
+    if (err instanceof SyntaxError) return [];
     throw err;
   }
 }
