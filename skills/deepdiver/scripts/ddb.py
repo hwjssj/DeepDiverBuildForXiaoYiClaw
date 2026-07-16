@@ -25,10 +25,40 @@ from pathlib import Path
 
 # ------------------------------- config ---------------------------------
 
+AUTH_FILE = Path.home() / ".deepdiver" / "auth.json"
+
+
+def read_auth():
+    """读取本地持久化的认证信息；不存在或损坏时返回空 dict。"""
+    if not AUTH_FILE.exists():
+        return {}
+    try:
+        with AUTH_FILE.open("r", encoding="utf-8") as f:
+            return json.loads(f.read())
+    except Exception:
+        eprint(f"[auth] 读取 {AUTH_FILE} 失败，忽略已保存的 key")
+        return {}
+
+
+def write_auth(data):
+    """原子写入认证信息，权限 600。"""
+    AUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = AUTH_FILE.with_suffix(AUTH_FILE.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    tmp.replace(AUTH_FILE)
+    try:
+        os.chmod(AUTH_FILE, 0o600)
+    except OSError:
+        pass
+
+
 def load_cfg():
-    key = os.environ.get("DEEPDIVER_API_KEY", "").strip()
+    # 优先从本地 auth 文件读取，fallback 到环境变量
+    auth = read_auth()
+    key = auth.get("api_key", "").strip() or os.environ.get("DEEPDIVER_API_KEY", "").strip()
     if not key:
-        die("未设置 DEEPDIVER_API_KEY 环境变量（格式 sk-hdls-<32hex>）")
+        die("未设置 API key，请执行 ddb config --key <key> 或设置 DEEPDIVER_API_KEY 环境变量")
     return {
         "key": key,
         "base": os.environ.get("DEEPDIVER_BASE_URL", "https://deepdiver.app").rstrip("/"),
@@ -537,6 +567,20 @@ def cmd_cancel(args):
     print(f"HTTP={code} {json.dumps(r, ensure_ascii=False)}")
 
 
+def cmd_config(args):
+    """保存 API key 到本地 auth 文件，跨会话持久化。"""
+    data = {}
+    if AUTH_FILE.exists():
+        try:
+            with AUTH_FILE.open("r", encoding="utf-8") as f:
+                data = json.loads(f.read())
+        except Exception:
+            pass
+    data["api_key"] = args.key
+    write_auth(data)
+    print(f"API key 已保存至 {AUTH_FILE}")
+
+
 DESC = {
     "list": {
         "help": "ddb list [--refresh]\n         列出本地清单\n         示例: ddb list",
@@ -555,6 +599,9 @@ DESC = {
     },
     "cancel": {
         "help": "ddb cancel <task_id>\n         取消运行中任务\n         示例: ddb cancel 95c03763-xxx",
+    },
+    "config": {
+        "help": "ddb config --key <api_key>\n         保存 API key 至本地 ~/.deepdiver/auth.json（跨会话持久化）\n         示例: ddb config --key sk-hdls-abc123",
     },
 }
 
@@ -616,6 +663,10 @@ def build_parser():
     px = sub.add_parser("cancel", help=DESC["cancel"]["help"])
     px.add_argument("task_id")
     px.set_defaults(func=cmd_cancel)
+
+    pcfg = sub.add_parser("config", help=DESC["config"]["help"])
+    pcfg.add_argument("--key", required=True, help="DeepDiver API key（格式 sk-hdls-<32hex>）")
+    pcfg.set_defaults(func=cmd_config)
 
     return p
 
