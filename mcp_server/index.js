@@ -1,342 +1,474 @@
 #!/usr/bin/env node
 /**
- * DeepDiver MCP Server
+ * DeepDiver MCP Server — Headless API v1
  *
- * 提供 DeepDiver Build API 的 MCP 工具：
- * - ddb_login           登录并保存 token
- * - ddb_create_task     创建构建任务并返回项目信息
- * - ddb_check_progress  检查任务进度（文件、服务、构建状态）
- * - ddb_get_preview     获取预览 URL（自动启动 dev server）
- * - ddb_list_projects   查看所有项目及状态
+ * 9 个 MCP 工具:
+ *   ddb_setup           配置 headless API key
+ *   ddb_create_task     提交构建任务
+ *   ddb_check_progress  查询任务进度
+ *   ddb_stream_task     SSE 事件流快照
+ *   ddb_get_preview     获取预览 URL
+ *   ddb_respond         回答 agent 交互式提问
+ *   ddb_pause           暂停任务
+ *   ddb_cancel          取消任务
+ *   ddb_resume          恢复任务
  *
  * 环境变量:
  *   DEEPDIVER_BASE_URL  - API 地址 (默认 https://cn.deepdiver.app)
- *   DEEPDIVER_MODEL     - 模型 ID (默认 ddexp)
- *   DEEPDIVER_TOKEN_FILE - token 文件路径 (默认 .deepdiver-token)
+ *   DEEPDIVER_KEY       - headless key (优先级高于 .deepdiver-key 文件)
  */
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
-import crypto from 'crypto';
-import { readFileSync } from 'fs';
-import { resolve } from 'path';
 import {
-  login,
-  listProjects,
-  createProject,
-  getFiles,
-  getDevServerStatus,
-  startDevServer,
-  getUserInfo,
-  saveToken,
+  createTask,
+  getTask,
+  respondToTask,
+  cancelTask,
+  pauseTask,
+  resumeTask,
+  streamTask,
 } from './lib/api.js';
+import { loadKey, saveKey, addTask, touchTask, findActiveTask } from './lib/store.js';
 
-/** 获取 token：优先环境变量，其次文件 */
-function resolveToken() {
-  if (process.env.DEEPDIVER_TOKEN) return process.env.DEEPDIVER_TOKEN;
-  try {
-    const f = resolve(process.env.DEEPDIVER_TOKEN_FILE || '.deepdiver-token');
-    return readFileSync(f, 'utf-8').trim();
-  } catch {
-    return null;
+const BASE_URL = process.env.DEEPDIVER_BASE_URL || 'https://cn.deepdiver.app';
+
+// ---- 认证辅助 ----
+
+/** 从文件或环境变量获取 key，未配置时抛错 */
+function requireKey() {
+  const key = process.env.DEEPDIVER_KEY || loadKey();
+  if (!key) throw new Error('未配置 API key。请先使用 ddb_setup 工具设置，或设置 DEEPDIVER_KEY 环境变量');
+  return key;
+}
+
+// ---- 格式化辅助 ----
+
+/** 将事件的 data 简要格式化为一行 */
+function formatEventSummary(ev) {
+  if (!ev || !ev.type) return JSON.stringify(ev).slice(0, 100);
+  switch (ev.type) {
+    case 'start': return `🚀 任务开始: "${ev.data?.query || '?'}"`;
+    case 'iteration': return `🔄 迭代 #${ev.data?.iteration || '?'} | tokens: ${ev.data?.token_count || '?'}/${ev.data?.token_threshold || '?'}`;
+    case 'thinking': return `💭 ${String(ev.data?.content || '').slice(0, 120)}`;
+    case 'tool_call': return `🔧 ${ev.data?.tool || '?'} [${ev.data?.status || '?'}]`;
+    case 'agent_handoff': return `🤝 交接 → agent #${ev.data?.new_agent_id || '?'}`;
+    case 'subagent_start': return `🐣 子 agent 启动: ${ev.data?.task?.slice(0, 80) || '?'}`;
+    case 'subagent_complete': return `✅ 子 agent 完成: ${ev.data?.success ? '成功' : '失败'}`;
+    case 'complete': return ev.data?.success ? `✅ Agent 完成` : `❌ Agent 失败`;
+    case 'build_complete': return ev.data?.success ? `🏗️ 构建完成` : `❌ 构建失败`;
+    case 'interaction_required': return `❓ 等待用户回答`;
+    case 'error': return `💥 ${ev.data?.message || '未知错误'}`;
+    case 'cancelled': return `⛔ 已取消`;
+    case 'paused': return `⏸️ 已暂停`;
+    case 'resumed': return `▶️ 已恢复`;
+    default: return `${ev.type}`;
   }
 }
 
-/** 检查 token，未登录时抛错 */
-function requireToken() {
-  const token = resolveToken();
-  if (!token) throw new Error('未登录。请先使用 ddb_login 登录，或设置 DEEPDIVER_TOKEN 环境变量');
-  return token;
+/** 将状态翻译为中文 + emoji */
+function statusLabel(s) {
+  const map = {
+    running: '🏃 运行中',
+    paused: '⏸️ 已暂停',
+    completed: '✅ 已完成',
+    failed: '❌ 失败',
+    cancelled: '⛔ 已取消',
+    waiting_interaction: '❓ 等待回答',
+  };
+  return map[s] || `❓ ${s}`;
 }
 
-// ---------------------------------------------------------------------------
-// MCP Server
-// ---------------------------------------------------------------------------
+/** 判断是否为终态 */
+function isTerminal(s) {
+  return ['completed', 'failed', 'cancelled'].includes(s);
+}
+
+// ---- MCP Server ----
+
 const server = new Server(
-  { name: 'deepdiver-mcp', version: '1.0.0' },
+  { name: 'deepdiver-mcp', version: '2.0.0' },
   { capabilities: { tools: {} } },
 );
 
-// ---------------------------------------------------------------------------
-// 工具定义
-// ---------------------------------------------------------------------------
+// ---- 工具定义 ----
+
 const TOOLS = [
   {
-    name: 'ddb_login',
-    description: '登录 DeepDiver 并保存 JWT token 到文件',
+    name: 'ddb_setup',
+    description: '配置 DeepDiver Headless API key（格式 sk-hdls-<32 hex chars>）',
     inputSchema: {
       type: 'object',
       properties: {
-        email: { type: 'string', description: '登录邮箱' },
-        password: { type: 'string', description: '登录密码' },
+        headless_key: { type: 'string', description: 'Headless API key（sk-hdls-...）' },
       },
-      required: ['email', 'password'],
+      required: ['headless_key'],
     },
   },
   {
     name: 'ddb_create_task',
-    description: '创建 DeepDiver 构建任务（项目 + WebSocket 发送 prompt），返回项目信息和预览 URL',
+    description: '提交构建任务到 DeepDiver Headless API v1',
     inputSchema: {
       type: 'object',
       properties: {
         prompt: { type: 'string', description: '任务描述 / prompt' },
-        model: { type: 'string', description: '模型 ID，默认 ddexp' },
-        workspace_id: { type: 'string', description: '可选，指定已有 workspace_id（跳过项目创建）' },
+        model: { type: 'string', description: '模型 ID（默认 ddexp）' },
+        interaction_mode: { type: 'string', enum: ['auto', 'manual'], description: '交互模式（默认 manual）' },
+        screenshot: { type: 'boolean', description: '是否截图预览' },
+        callback_url: { type: 'string', description: 'Webhook 回调 URL（可选）' },
       },
       required: ['prompt'],
     },
   },
   {
     name: 'ddb_check_progress',
-    description: '检查任务进度：文件列表、开发服务器状态、构建队列状态',
+    description: '查询任务状态、事件和结果',
     inputSchema: {
       type: 'object',
       properties: {
-        workspace_id: { type: 'string', description: 'workspace_id（从 create_task 返回获得）' },
+        task_id: { type: 'string', description: '任务 ID（不传则自动找最近一个活跃任务）' },
       },
-      required: ['workspace_id'],
+    },
+  },
+  {
+    name: 'ddb_stream_task',
+    description: '获取任务的 SSE 事件流快照（最近 N 条事件）',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: '任务 ID' },
+        max_events: { type: 'number', description: '最多返回条数（默认 50）' },
+      },
+      required: ['task_id'],
     },
   },
   {
     name: 'ddb_get_preview',
-    description: '获取预览 URL（自动启动开发服务器并等待就绪）',
+    description: '获取任务的预览 URL',
     inputSchema: {
       type: 'object',
       properties: {
-        workspace_id: { type: 'string', description: 'workspace_id' },
-        wait_seconds: { type: 'number', description: '等待超时秒数，默认 60', default: 60 },
+        task_id: { type: 'string', description: '任务 ID（不传则找最近一个）' },
       },
-      required: ['workspace_id'],
     },
   },
   {
-    name: 'ddb_list_projects',
-    description: '列出所有项目及构建状态',
+    name: 'ddb_respond',
+    description: '回答 agent 的交互式提问（当任务处于 waiting_interaction 状态时使用）',
     inputSchema: {
       type: 'object',
-      properties: {},
+      properties: {
+        task_id: { type: 'string', description: '任务 ID' },
+        interaction_id: { type: 'string', description: '交互 ID（来自 check_progress 返回的 interaction.interaction_id）' },
+        response: { type: 'string', description: '回答内容（JSON 字符串，如 {"answer": "使用 TypeScript"}）' },
+      },
+      required: ['task_id', 'interaction_id', 'response'],
+    },
+  },
+  {
+    name: 'ddb_pause',
+    description: '暂停正在运行的任务',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: '任务 ID' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'ddb_cancel',
+    description: '取消正在运行的任务',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: '任务 ID' },
+      },
+      required: ['task_id'],
+    },
+  },
+  {
+    name: 'ddb_resume',
+    description: '恢复已暂停的任务',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        task_id: { type: 'string', description: '任务 ID' },
+      },
+      required: ['task_id'],
     },
   },
 ];
 
-// ---------------------------------------------------------------------------
-// 工具实现
-// ---------------------------------------------------------------------------
+// ---- Handler ----
 
-/** ddb_login */
-async function handleLogin(args) {
-  const { email, password } = z.object({
-    email: z.string().email(),
-    password: z.string().min(1),
+/** ddb_setup */
+async function handleSetup(args) {
+  const { headless_key } = z.object({
+    headless_key: z.string().regex(/^sk-hdls-[0-9a-f]{32}$/, 'key 格式错误，应为 sk-hdls-<32 hex chars>'),
   }).parse(args);
 
-  const data = await login(email, password);
-  const token = data.access_token;
-  if (!token) throw new Error('登录响应中未找到 access_token');
-
-  const path = saveToken(token);
-  const user = data.user || {};
-
+  const path = saveKey(headless_key);
   return {
-    content: [{
-      type: 'text',
-      text: `✅ 登录成功\n用户: ${user.display_name || user.email || '?'}\n邮箱: ${user.email || '?'}\nToken 已保存到: ${path}`,
-    }],
+    content: [{ type: 'text', text: `✅ API key 已保存到: ${path}` }],
   };
 }
 
-/** ddb_list_projects */
-async function handleListProjects() {
-  const data = await listProjects();
-  const projects = data.projects || [];
-  const building = data.building_workspace_ids || [];
+/** ddb_create_task */
+async function handleCreateTask(args) {
+  const { prompt, model, interaction_mode, screenshot, callback_url } = z.object({
+    prompt: z.string().min(1),
+    model: z.string().optional(),
+    interaction_mode: z.enum(['auto', 'manual']).optional().default('manual'),
+    screenshot: z.boolean().optional().default(false),
+    callback_url: z.string().optional(),
+  }).parse(args);
 
-  if (projects.length === 0) {
-    return { content: [{ type: 'text', text: '暂无项目' }] };
+  requireKey();
+
+  const data = await createTask({
+    query: prompt, model: model || null, interaction_mode,
+    screenshot, callback_url: callback_url || null,
+  });
+
+  // 写入本地
+  addTask({
+    task_id: data.task_id,
+    workspace_id: data.workspace_id,
+    resume_token: data.resume_token || '',
+    prompt,
+    model: model || 'ddexp',
+    interaction_mode,
+  });
+
+  const lines = [
+    `✅ 任务已提交`,
+    `   Task ID:      ${data.task_id}`,
+    `   Workspace ID: ${data.workspace_id}`,
+    `   Resume Token: ${data.resume_token || '(follow-up, 无)'}`,
+    `   状态:         ${statusLabel(data.status)}`,
+    ``,
+    `💡 使用 ddb_check_progress --task_id "${data.task_id}" 检查进度`,
+    `💡 使用 ddb_get_preview --task_id "${data.task_id}" 获取预览`,
+    data.resume_token
+      ? `⚠️ 请保存 resume_token，后续 follow-up 查询需要使用`
+      : '',
+  ].filter(Boolean);
+
+  return { content: [{ type: 'text', text: lines.join('\n') }] };
+}
+
+/** ddb_check_progress */
+async function handleCheckProgress(args) {
+  const { task_id } = z.object({
+    task_id: z.string().optional(),
+  }).parse(args);
+
+  requireKey();
+
+  // 智能解析 task_id
+  let tid = task_id;
+  if (!tid) {
+    const active = findActiveTask();
+    if (!active) throw new Error('未找到本地任务记录。请先使用 ddb_create_task 创建任务，或指定 --task_id');
+    tid = active.task_id;
   }
 
-  const lines = [`共 ${data.total || projects.length} 个项目，${building.length} 个正在构建`, ''];
-  for (const p of projects) {
-    const isBuilding = building.includes(p.workspace_id);
-    lines.push(`${isBuilding ? '🏗️' : '✅'} ${p.name}`);
-    lines.push(`   ID: ${p.id}`);
-    lines.push(`   workspace_id: ${p.workspace_id}`);
-    lines.push(`   模型: ${p.settings?.model || '?'}`);
-    lines.push(`   创建: ${p.created_at ? new Date(p.created_at).toLocaleString() : '?'}`);
+  const data = await getTask(tid);
+  touchTask(tid);
+
+  const events = data.events || [];
+  const result = data.result;
+  const interaction = data.interaction;
+
+  const lines = [
+    `📋 任务: ${tid}`,
+    `   Workspace ID: ${data.workspace_id || '?'}`,
+    `   状态: ${statusLabel(data.status)}`,
+  ];
+
+  if (data.current_iteration != null) {
+    lines.push(`   迭代: #${data.current_iteration}`);
+  }
+
+  // 事件摘要
+  if (events.length > 0) {
     lines.push('');
+    lines.push('📜 最近事件:');
+    events.slice(-10).forEach(e => {
+      lines.push(`   ${formatEventSummary(e)}`);
+    });
+    if (events.length > 10) lines.push(`   ... 共 ${events.length} 条事件`);
+  }
+
+  lines.push('');
+
+  // 结果
+  if (result) {
+    lines.push('📦 结果:');
+    lines.push(`   成功: ${result.success ? '✅' : '❌'}`);
+    if (result.iterations) lines.push(`   迭代数: ${result.iterations}`);
+    if (result.execution_time) lines.push(`   耗时: ${result.execution_time}s`);
+    if (result.preview_url) lines.push(`   预览: ${result.preview_url}`);
+    if (result.project_name) lines.push(`   项目名: ${result.project_name}`);
+    if (result.final_answer) {
+      const ans = String(result.final_answer).slice(0, 300);
+      lines.push(`   回答: ${ans}${result.final_answer.length > 300 ? '...' : ''}`);
+    }
+    if (result.key_files?.length) {
+      lines.push(`   关键文件: ${result.key_files.map(f => typeof f === 'string' ? f : f.file_path).join(', ')}`);
+    }
+  }
+
+  // 待回答的交互
+  if (interaction && data.status === 'waiting_interaction') {
+    lines.push('');
+    lines.push('❓ 等待用户回答:');
+    lines.push(`   interaction_id: ${interaction.interaction_id}`);
+    if (interaction.questions) {
+      interaction.questions.forEach((q, i) => {
+        lines.push(`   问题 ${i + 1}: ${q.prompt || q.question}`);
+        if (q.options) {
+          const opts = Array.isArray(q.options) ? q.options : q.options.split(',');
+          lines.push(`   选项: ${opts.join(' | ')}`);
+        }
+      });
+    }
+    lines.push('');
+    lines.push('💡 使用 ddb_respond 回答后 agent 将继续执行');
+  }
+
+  if (isTerminal(data.status)) {
+    lines.push('');
+    lines.push(data.status === 'completed' ? '✅ 任务已完成' : `⚠️ 任务已结束: ${data.status}`);
   }
 
   return { content: [{ type: 'text', text: lines.join('\n') }] };
 }
 
-/** ddb_create_task */
-async function handleCreateTask(args) {
-  const schema = z.object({
-    prompt: z.string().min(1),
-    model: z.string().optional().default('ddexp'),
-    workspace_id: z.string().optional(),
-  });
-  const { prompt, model, workspace_id: existingWsId } = schema.parse(args);
+/** ddb_stream_task */
+async function handleStreamTask(args) {
+  const { task_id, max_events } = z.object({
+    task_id: z.string().min(1),
+    max_events: z.number().optional().default(50),
+  }).parse(args);
 
-  const token = requireToken();
-  const workspaceId = existingWsId || crypto.randomUUID();
-  const resumeToken = existingWsId ? '(existing)' : crypto.randomBytes(32).toString('base64url');
-  const projectName = `Project ${workspaceId.slice(0, 8)}`;
+  requireKey();
 
-  // 创建项目
-  let project;
-  if (!existingWsId) {
-    project = await createProject(token, {
-      workspaceId,
-      name: projectName,
-      resumeToken,
-      model,
-    });
+  const result = await streamTask(task_id, { maxEvents: max_events, timeoutMs: 30000 });
+  touchTask(task_id);
+
+  if (result.events.length === 0) {
+    return { content: [{ type: 'text', text: '📡 暂无事件（任务可能尚未开始或已过期）' }] };
   }
-
-  // 通过 WebSocket 发送 prompt
-  const wsUrl = `wss://cn.deepdiver.app/ws/agent?token=${encodeURIComponent(token)}`;
-  const ws = new WebSocket(wsUrl);
-  await new Promise((resolve, reject) => {
-    const t = setTimeout(() => { ws.close(); reject(new Error('WS 连接超时')); }, 15000);
-    ws.addEventListener('open', () => {
-      clearTimeout(t);
-      ws.send(JSON.stringify({ session_id: workspaceId }));
-      setTimeout(() => {
-        ws.send(JSON.stringify({
-          model,
-          settings: { model_temperature: 0.7, model_max_tokens: 64000 },
-        }));
-      }, 200);
-      setTimeout(() => {
-        ws.send(JSON.stringify({
-          type: 'query', query: prompt, is_followup: false,
-        }));
-      }, 400);
-      setTimeout(() => { ws.close(); resolve(); }, 1000);
-    }, { once: true });
-    ws.addEventListener('error', () => { clearTimeout(t); reject(new Error('WS 连接失败')); }, { once: true });
-  });
-
-  const previewUrl = existingWsId
-    ? `https://deepdiver.app/preview/${workspaceId}/?token=${resumeToken}`
-    : `https://deepdiver.app/preview/${workspaceId}/?token=${resumeToken}`;
 
   const lines = [
-    `✅ 任务已创建`,
-    `   项目 ID: ${project?.id || '(existing)'}`,
-    `   Workspace ID: ${workspaceId}`,
-    `   模型: ${model}`,
-    `   Prompt: ${prompt}`,
-    `   预览 URL: ${previewUrl}`,
-    ``,
-    `💡 使用 ddb_check_progress --workspace_id "${workspaceId}" 检查进度`,
-    `💡 使用 ddb_get_preview --workspace_id "${workspaceId}" 获取预览`,
+    `📡 SSE 事件流（共 ${result.events.length} 条）:`,
+    '',
   ];
+  result.events.forEach((ev, i) => {
+    lines.push(`[${i + 1}] ${formatEventSummary(ev)}`);
+  });
 
-  return {
-    content: [{ type: 'text', text: lines.join('\n') }],
-    _meta: { workspace_id: workspaceId, preview_url: previewUrl },
-  };
-}
-
-/** ddb_check_progress */
-async function handleCheckProgress(args) {
-  const { workspace_id } = z.object({ workspace_id: z.string().min(1) }).parse(args);
-  const token = requireToken();
-
-  let files = null, dev = null, proj = null;
-  try { files = await getFiles(token, workspace_id); } catch {}
-  try { dev = await getDevServerStatus(token, workspace_id); } catch {}
-  try { proj = await listProjects(token); } catch {}
-
-  const building = proj?.building_workspace_ids?.includes(workspace_id);
-  const fileList = files?.files || [];
-  const devRunning = dev?.success && dev?.metadata?.running;
-
-  const parts = [];
-  if (building) parts.push('🏗️ 任务正在构建中');
-  else if (devRunning) parts.push('✅ 任务已完成');
-  else parts.push('⏳ 任务执行中');
-
-  const totalSize = fileList.reduce((s, f) => s + (f.size || 0), 0);
-  const sorted = [...fileList].filter(f => f.type === 'file')
-    .sort((a, b) => new Date(b.modified || 0) - new Date(a.modified || 0));
-
-  parts.push('');
-  parts.push(`📁 文件: ${fileList.length} 个 (${(totalSize/1024).toFixed(0)} KB)`);
-  sorted.slice(0, 5).forEach(f => parts.push(`   · ${f.path}`));
-  parts.push('');
-
-  if (devRunning) {
-    parts.push(`🌐 开发服务器: 已就绪 ${dev.metadata.url}`);
-  } else if (dev?.metadata) {
-    parts.push('🌐 开发服务器: 未启动');
-  } else {
-    parts.push('🌐 开发服务器: 查询失败');
-  }
-  parts.push('');
-
-  if (proj) {
-    parts.push(`📋 总项目: ${proj.total || '?'} | 构建中: ${proj.building_workspace_ids?.length || 0}`);
-  }
-
-  return { content: [{ type: 'text', text: parts.join('\n') }] };
+  return { content: [{ type: 'text', text: lines.join('\n') }] };
 }
 
 /** ddb_get_preview */
 async function handleGetPreview(args) {
-  const { workspace_id, wait_seconds } = z.object({
-    workspace_id: z.string().min(1),
-    wait_seconds: z.number().optional().default(60),
+  const { task_id } = z.object({
+    task_id: z.string().optional(),
   }).parse(args);
 
-  const token = requireToken();
+  requireKey();
 
-  // 先检查是否已运行
-  const status = await getDevServerStatus(token, workspace_id);
-  if (status.success && status.metadata?.running) {
+  let tid = task_id;
+  if (!tid) {
+    const active = findActiveTask();
+    if (!active) throw new Error('未找到本地任务记录。请先使用 ddb_create_task 或指定 --task_id');
+    tid = active.task_id;
+  }
+
+  const data = await getTask(tid);
+  touchTask(tid);
+
+  if (data.status === 'completed' && data.result?.preview_url) {
+    const lines = [
+      `🌐 预览已就绪`,
+      `   URL: ${data.result.preview_url}`,
+    ];
+    if (data.result.project_name) lines.push(`   项目: ${data.result.project_name}`);
+    return { content: [{ type: 'text', text: lines.join('\n') }] };
+  }
+
+  if (data.result?.preview_url) {
     return {
-      content: [{
-        type: 'text',
-        text: `🌐 预览已就绪\nURL: ${status.metadata.url}`,
-      }],
+      content: [{ type: 'text', text: `🌐 预览 URL: ${data.result.preview_url}\n   状态: ${statusLabel(data.status)}` }],
     };
   }
 
-  // 未运行则启动
-  const result = await startDevServer(token, workspace_id);
-  if (result.success && result.metadata?.running) {
-    return {
-      content: [{
-        type: 'text',
-        text: `🌐 预览已就绪\nURL: ${result.metadata.url}`,
-      }],
-    };
-  }
-
-  // 等待就绪
-  const deadline = Date.now() + wait_seconds * 1000;
-  while (Date.now() < deadline) {
-    await new Promise(r => setTimeout(r, 3000));
-    const s = await getDevServerStatus(token, workspace_id);
-    if (s.success && s.metadata?.running) {
-      return {
-        content: [{
-          type: 'text',
-          text: `🌐 预览已就绪\nURL: ${s.metadata.url}`,
-        }],
-      };
-    }
-  }
-
-  throw new Error('等待开发服务器就绪超时');
+  return {
+    content: [{
+      type: 'text',
+      text: `⏳ 预览尚未就绪\n   当前状态: ${statusLabel(data.status)}\n   💡 任务完成后自动生成 preview_url`,
+    }],
+  };
 }
 
-// ---------------------------------------------------------------------------
-// 路由
-// ---------------------------------------------------------------------------
+/** ddb_respond */
+async function handleRespond(args) {
+  const { task_id, interaction_id, response } = z.object({
+    task_id: z.string().min(1),
+    interaction_id: z.string().min(1),
+    response: z.string().min(1),
+  }).parse(args);
+
+  requireKey();
+
+  let respObj;
+  try {
+    respObj = JSON.parse(response);
+  } catch {
+    respObj = { answer: response };
+  }
+
+  const data = await respondToTask(task_id, interaction_id, respObj);
+  touchTask(task_id);
+
+  return {
+    content: [{ type: 'text', text: `✅ 回答已提交\n   任务状态: ${statusLabel(data.status || 'running')}` }],
+  };
+}
+
+/** ddb_pause */
+async function handlePause(args) {
+  const { task_id } = z.object({ task_id: z.string().min(1) }).parse(args);
+  requireKey();
+  const data = await pauseTask(task_id);
+  touchTask(task_id);
+  return { content: [{ type: 'text', text: `⏸️ 任务已暂停\n   状态: ${statusLabel(data.status || 'paused')}` }] };
+}
+
+/** ddb_cancel */
+async function handleCancel(args) {
+  const { task_id } = z.object({ task_id: z.string().min(1) }).parse(args);
+  requireKey();
+  const data = await cancelTask(task_id);
+  touchTask(task_id);
+  return { content: [{ type: 'text', text: `⛔ 任务已取消\n   状态: ${statusLabel(data.status || 'cancelled')}` }] };
+}
+
+/** ddb_resume */
+async function handleResume(args) {
+  const { task_id } = z.object({ task_id: z.string().min(1) }).parse(args);
+  requireKey();
+  const data = await resumeTask(task_id);
+  touchTask(task_id);
+  return { content: [{ type: 'text', text: `▶️ 任务已恢复\n   状态: ${statusLabel(data.status || 'running')}` }] };
+}
+
+// ---- 路由 ----
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
 
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
@@ -344,23 +476,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   let result;
   try {
     switch (name) {
-      case 'ddb_login':
-        result = await handleLogin(args);
-        break;
-      case 'ddb_create_task':
-        result = await handleCreateTask(args);
-        break;
-      case 'ddb_check_progress':
-        result = await handleCheckProgress(args);
-        break;
-      case 'ddb_get_preview':
-        result = await handleGetPreview(args);
-        break;
-      case 'ddb_list_projects':
-        result = await handleListProjects(args);
-        break;
-      default:
-        throw new Error(`未知工具: ${name}`);
+      case 'ddb_setup':           result = await handleSetup(args); break;
+      case 'ddb_create_task':      result = await handleCreateTask(args); break;
+      case 'ddb_check_progress':   result = await handleCheckProgress(args); break;
+      case 'ddb_stream_task':      result = await handleStreamTask(args); break;
+      case 'ddb_get_preview':      result = await handleGetPreview(args); break;
+      case 'ddb_respond':          result = await handleRespond(args); break;
+      case 'ddb_pause':            result = await handlePause(args); break;
+      case 'ddb_cancel':           result = await handleCancel(args); break;
+      case 'ddb_resume':           result = await handleResume(args); break;
+      default: throw new Error(`未知工具: ${name}`);
     }
     return result;
   } catch (err) {
@@ -372,13 +497,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// ---------------------------------------------------------------------------
-// 启动
-// ---------------------------------------------------------------------------
+// ---- 启动 ----
+
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error('✅ DeepDiver MCP Server 已启动 (stdio)');
+  console.error('✅ DeepDiver MCP Server v2.0 已启动 (Headless v1 + stdio)');
 }
 
 main().catch(err => {
