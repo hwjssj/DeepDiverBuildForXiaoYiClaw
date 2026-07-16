@@ -128,69 +128,79 @@ export async function streamTask(taskId, opts = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-  const res = await fetch(url, {
-    headers: { 'Authorization': `Bearer ${key}`, 'Cache-Control': 'no-cache',
-               'Accept': 'text/event-stream' },
-    signal: controller.signal,
-  });
-
-  if (!res.ok) {
-    clearTimeout(timer);
-    const text = await res.text();
-    throw new Error(`SSE ${res.status}: ${text.slice(0, 300)}`);
-  }
-
   const events = [];
   const terminalTypes = new Set(['build_complete', 'complete', 'error', 'cancelled']);
-  let buffer = '';
-  let currentEvent = null;
-
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let done = false;
+  let terminalReceived = false;
 
   try {
-    while (!done) {
-      const { value, done: streamDone } = await reader.read();
-      if (value) {
-        buffer += decoder.decode(value, { stream: !streamDone });
-        const lines = buffer.split('\n');
-        buffer = lines.pop(); // 保留最后不完整的行
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${key}`, 'Cache-Control': 'no-cache',
+                 'Accept': 'text/event-stream' },
+      signal: controller.signal,
+    });
 
-        for (const line of lines) {
-          if (line.startsWith('event: ')) {
-            currentEvent = line.slice(7).trim();
-          } else if (line.startsWith('data: ')) {
-            const dataStr = line.slice(6);
-            try {
-              const data = JSON.parse(dataStr);
-              const evtType = currentEvent;  // 先保存，下面要消费
-              events.push({ eventType: evtType, ...data });
-              currentEvent = null;
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`SSE ${res.status}: ${text.slice(0, 300)}`);
+    }
 
-              // 终端事件: event:done 或 data.type 是 terminal
-              if (evtType === 'done' || (data.type && terminalTypes.has(data.type))) {
-                done = true;
-                break;
+    let buffer = '';
+    let currentEvent = null;
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let done = false;
+
+    try {
+      while (!done) {
+        const { value, done: streamDone } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: !streamDone });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // 保留最后不完整的行
+
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              currentEvent = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              const dataStr = line.slice(6);
+              try {
+                const data = JSON.parse(dataStr);
+                const evtType = currentEvent;  // 先保存，下面要消费
+                events.push({ eventType: evtType, ...data });
+                currentEvent = null;
+
+                // 终端事件: event:done 或 data.type 是 terminal
+                if (evtType === 'done' || (data.type && terminalTypes.has(data.type))) {
+                  terminalReceived = true;
+                  done = true;
+                  break;
+                }
+              } catch {
+                events.push({ eventType: currentEvent, raw: dataStr });
+                currentEvent = null;
               }
-            } catch {
-              events.push({ eventType: currentEvent, raw: dataStr });
-              currentEvent = null;
+            }
+
+            if (events.length >= maxEvents) {
+              done = true;
+              break;
             }
           }
-
-          if (events.length >= maxEvents) {
-            done = true;
-            break;
-          }
         }
+        if (streamDone) done = true;
       }
-      if (streamDone) done = true;
+    } finally {
+      reader.cancel();
     }
+  } catch (err) {
+    if (err.name === 'AbortError') {
+      return { events, done: false };
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
-    reader.cancel();
   }
 
-  return { events, done: true };
+  return { events, done: terminalReceived };
 }
