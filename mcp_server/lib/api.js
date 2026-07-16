@@ -1,100 +1,196 @@
 /**
- * DeepDiver REST API 客户端
- * 所有与 DeepDiver 后端的 HTTP 通信
+ * DeepDiver Headless API v1 客户端
+ * 所有请求统一: Authorization: Bearer sk-hdls-...
  */
-import { readFileSync, writeFileSync } from 'fs';
-import { resolve } from 'path';
+import { loadKey } from './store.js';
 
 const BASE_URL = process.env.DEEPDIVER_BASE_URL || 'https://cn.deepdiver.app';
 
-/** 从 .deepdiver-token 文件读取 token */
-function getSavedToken() {
-  try {
-    const f = resolve(process.env.DEEPDIVER_TOKEN_FILE || '.deepdiver-token');
-    return readFileSync(f, 'utf-8').trim();
-  } catch {
-    return null;
-  }
+/** 获取当前 headless key，未配置时抛错 */
+function requireKey() {
+  const key = loadKey();
+  if (!key) throw new Error('未配置 API key。请先使用 ddb_setup 或设置 DEEPDIVER_KEY 环境变量');
+  return key;
 }
 
-/** 通用 fetch 包装 */
-async function apiFetch(path, options = {}) {
+/**
+ * 通用 fetch 包装
+ * @param {string} path - API 路径 (如 "/api/v1/tasks")
+ * @param {object} opts - fetch options (不含 headers)
+ * @returns {Promise<object>} 解析后的 JSON
+ */
+async function v1Fetch(path, opts = {}) {
   const url = `${BASE_URL}${path}`;
-  const headers = { ...options.headers };
-  // token: 传 null 表示跳过 auth，传 false 不传，传字符串就用它，不传则从文件读
-  if (options.token !== null) {
-    const token = options.token || getSavedToken();
-    if (token) headers['Authorization'] = `Bearer ${token}`;
-  }
-  // 没有 body 时自动设 Content-Length: 0
-  if (!options.body && !headers['Content-Length']) {
-    headers['Content-Length'] = '0';
+  const key = process.env.DEEPDIVER_KEY || requireKey();
+  const headers = {
+    'Authorization': `Bearer ${key}`,
+    ...opts.headers,
+  };
+  if (!headers['Content-Type'] && !headers['content-type']) {
+    headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(url, { ...options, headers });
+  let res;
+  try {
+    res = await fetch(url, { ...opts, headers });
+  } catch (err) {
+    throw new Error(`网络错误: ${err.message}`);
+  }
+
+  const body = await res.text();
+  let data;
+  try { data = JSON.parse(body); } catch { data = { _raw: body }; }
+
   if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`API ${res.status}: ${text.slice(0, 300)}`);
+    const detail = data.detail || data._raw || body;
+    const err = new Error(`HTTP ${res.status}: ${String(detail).slice(0, 500)}`);
+    err.status = res.status;
+    throw err;
   }
-  return res.json();
+  return data;
 }
 
-/** 登录，返回 { access_token, user } */
-export async function login(email, password) {
-  return apiFetch('/api/users/login', {
+// ---- 任务端点 ----
+
+/** POST /api/v1/tasks — 创建任务 */
+export async function createTask(params) {
+  const { query, model, workspace_id, resume_token, skip_rewriter,
+          interaction_mode, settings, screenshot, platform,
+          callback_url, callback_secret, callback_headers } = params;
+  const body = { query, model: model || null, workspace_id: workspace_id || null,
+    resume_token: resume_token || null, skip_rewriter: skip_rewriter || false,
+    interaction_mode: interaction_mode || 'manual', settings: settings || null,
+    screenshot: screenshot || false, platform: platform || null,
+    callback_url: callback_url || null, callback_secret: callback_secret || null,
+    callback_headers: callback_headers || null };
+  return v1Fetch('/api/v1/tasks', { method: 'POST', body: JSON.stringify(body) });
+}
+
+/** GET /api/v1/tasks/{task_id} — 查询任务状态 */
+export async function getTask(taskId) {
+  return v1Fetch(`/api/v1/tasks/${taskId}`);
+}
+
+/** GET /api/v1/tasks/{task_id}?format=batch_v2 — 获取训练轨迹 */
+export async function getTaskBatchV2(taskId, params = {}) {
+  const qs = new URLSearchParams({ format: 'batch_v2', ...params }).toString();
+  return v1Fetch(`/api/v1/tasks/${taskId}?${qs}`);
+}
+
+/** POST /api/v1/tasks/{task_id}/respond — 回答交互 */
+export async function respondToTask(taskId, interactionId, response) {
+  return v1Fetch(`/api/v1/tasks/${taskId}/respond`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password }),
-    token: null, // 不传 auth header
+    body: JSON.stringify({ interaction_id: interactionId, response }),
   });
 }
 
-/** 获取项目列表，返回 { projects, total, building_workspace_ids } */
-export async function listProjects(token) {
-  return apiFetch('/api/projects', { token });
+/** POST /api/v1/tasks/{task_id}/cancel */
+export async function cancelTask(taskId) {
+  return v1Fetch(`/api/v1/tasks/${taskId}/cancel`, { method: 'POST' });
 }
 
-/** 创建项目，返回 project 对象 */
-export async function createProject(token, { workspaceId, name, resumeToken, model }) {
-  return apiFetch('/api/projects', {
+/** POST /api/v1/tasks/{task_id}/pause */
+export async function pauseTask(taskId) {
+  return v1Fetch(`/api/v1/tasks/${taskId}/pause`, { method: 'POST' });
+}
+
+/** POST /api/v1/tasks/{task_id}/resume */
+export async function resumeTask(taskId) {
+  return v1Fetch(`/api/v1/tasks/${taskId}/resume`, { method: 'POST' });
+}
+
+/** POST /api/v1/tasks/{task_id}/message — 注入消息 */
+export async function injectMessage(taskId, message) {
+  return v1Fetch(`/api/v1/tasks/${taskId}/message`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      name,
-      workspace_id: workspaceId,
-      resume_token: resumeToken,
-      settings: { model: model || process.env.DEEPDIVER_MODEL || 'ddexp' },
-    }),
-    token,
+    body: JSON.stringify({ message }),
   });
 }
 
-/** 获取文件列表，返回 { files, session_id } */
-export async function getFiles(token, sessionId) {
-  return apiFetch(`/api/files/${sessionId}?path=&max_depth=5`, { token });
-}
+// ---- SSE ----
 
-/** 检查开发服务器状态 */
-export async function getDevServerStatus(token, sessionId) {
-  return apiFetch(`/api/dev-server-status?session_id=${sessionId}`, { token });
-}
+/**
+ * GET /api/v1/tasks/{task_id}/stream — SSE 事件流快照
+ * 收集 events 直到: (a) 达到 maxEvents, (b) 收到 terminal event, (c) 超时
+ *
+ * @param {string} taskId
+ * @param {object} opts
+ * @param {number} opts.maxEvents - 最多收集的事件数 (默认 50)
+ * @param {number} opts.timeoutMs - 超时毫秒 (默认 30000)
+ * @returns {Promise<{events: Array, done: boolean}>}
+ */
+export async function streamTask(taskId, opts = {}) {
+  const { maxEvents = 50, timeoutMs = 30000 } = opts;
+  const key = process.env.DEEPDIVER_KEY || requireKey();
+  const url = `${BASE_URL}/api/v1/tasks/${taskId}/stream`;
 
-/** 启动开发服务器，返回 { success, metadata: { url, running, port, server_type } } */
-export async function startDevServer(token, sessionId) {
-  return apiFetch(`/api/start-dev-server?session_id=${sessionId}`, {
-    method: 'POST',
-    token,
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  const res = await fetch(url, {
+    headers: { 'Authorization': `Bearer ${key}`, 'Cache-Control': 'no-cache',
+               'Accept': 'text/event-stream' },
+    signal: controller.signal,
   });
-}
 
-/** 获取当前用户信息 */
-export async function getUserInfo(token) {
-  return apiFetch('/api/users/me', { token });
-}
+  if (!res.ok) {
+    clearTimeout(timer);
+    const text = await res.text();
+    throw new Error(`SSE ${res.status}: ${text.slice(0, 300)}`);
+  }
 
-/** 保存 token 到文件 */
-export function saveToken(token) {
-  const f = resolve(process.env.DEEPDIVER_TOKEN_FILE || '.deepdiver-token');
-  writeFileSync(f, token, 'utf-8');
-  return f;
+  const events = [];
+  const terminalTypes = new Set(['build_complete', 'complete', 'error', 'cancelled']);
+  let buffer = '';
+  let currentEvent = null;
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let done = false;
+
+  try {
+    while (!done) {
+      const { value, done: streamDone } = await reader.read();
+      if (value) {
+        buffer += decoder.decode(value, { stream: !streamDone });
+        const lines = buffer.split('\n');
+        buffer = lines.pop(); // 保留最后不完整的行
+
+        for (const line of lines) {
+          if (line.startsWith('event: ')) {
+            currentEvent = line.slice(7).trim();
+          } else if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6);
+            try {
+              const data = JSON.parse(dataStr);
+              const evtType = currentEvent;  // 先保存，下面要消费
+              events.push({ eventType: evtType, ...data });
+              currentEvent = null;
+
+              // 终端事件: event:done 或 data.type 是 terminal
+              if (evtType === 'done' || (data.type && terminalTypes.has(data.type))) {
+                done = true;
+                break;
+              }
+            } catch {
+              events.push({ eventType: currentEvent, raw: dataStr });
+              currentEvent = null;
+            }
+          }
+
+          if (events.length >= maxEvents) {
+            done = true;
+            break;
+          }
+        }
+      }
+      if (streamDone) done = true;
+    }
+  } finally {
+    clearTimeout(timer);
+    reader.cancel();
+  }
+
+  return { events, done: true };
 }
