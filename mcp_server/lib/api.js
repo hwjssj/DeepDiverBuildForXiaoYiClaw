@@ -34,7 +34,7 @@ async function v1Fetch(path, opts = {}) {
   try {
     res = await fetch(url, { ...opts, headers });
   } catch (err) {
-    throw new Error(`网络错误: ${err.message}`);
+    throw new Error(`网络错误: ${err.message}`, { cause: err });
   }
 
   const body = await res.text();
@@ -180,6 +180,8 @@ export async function streamTask(taskId, opts = {}) {
                 events.push({ eventType: currentEvent, raw: dataStr });
                 currentEvent = null;
               }
+            } else if (line.trim() === '') {
+              currentEvent = null;
             }
 
             if (events.length >= maxEvents) {
@@ -189,6 +191,26 @@ export async function streamTask(taskId, opts = {}) {
           }
         }
         if (streamDone) done = true;
+      }
+      // 流结束后处理缓冲区中可能残留的完整 SSE 行
+      if (buffer.trim()) {
+        if (buffer.startsWith('event: ')) {
+          currentEvent = buffer.slice(7).trim();
+        } else if (buffer.startsWith('data: ')) {
+          const dataStr = buffer.slice(6);
+          try {
+            const data = JSON.parse(dataStr);
+            const evtType = currentEvent;
+            events.push({ eventType: evtType, ...data });
+            currentEvent = null;
+            if (evtType === 'done' || (data.type && terminalTypes.has(data.type))) {
+              terminalReceived = true;
+            }
+          } catch {
+            events.push({ eventType: currentEvent, raw: dataStr });
+            currentEvent = null;
+          }
+        }
       }
     } finally {
       reader.cancel();
