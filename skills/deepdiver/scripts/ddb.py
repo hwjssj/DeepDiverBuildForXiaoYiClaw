@@ -269,12 +269,46 @@ def extract_terminal(cfg, payload):
     }
 
 
+# ------------------------- concurrency guard ---------------------------
+#
+# SKILL.md 规定最大并发数为 1：已有非终态任务时，禁止 create / followup。
+# 本函数检查本地清单；清单中每条非终态记录都通过 API 二次确认后硬性拦截。
+
+def check_no_running_task(cfg):
+    """清单中存在非终态任务时 die，终态自动回写以保持清单清洁。"""
+    rows = read_manifest(cfg["apps_file"])
+    terminals = {"completed", "failed", "cancelled", "success"}
+
+    for r in rows:
+        status = r.get("status", "")
+        tid = r.get("task_id")
+        if not tid:
+            continue
+        if status in terminals:
+            continue
+
+        # 非终态 / unknown — 调用 API 确认
+        code, st = api(cfg, "GET", f"/api/v1/tasks/{tid}", timeout=10)
+        current = st.get("status", "") if code == 200 else ""
+
+        if code == 200 and current in terminals:
+            # 之前在跑但现在已结束 → 回写清单
+            update_row(cfg["apps_file"], "task_id", tid, {"status": current})
+            continue
+
+        # 确认仍在运行 / API 不通 → 拦截
+        display = current or status or "unknown"
+        die(f"已有任务在运行中 (task_id={tid}, status={display})，"
+            f"请等待其完成后再创建新任务")
+
+
 # ------------------------------ commands --------------------------------
 
 def cmd_create(args):
     cfg = load_cfg()
     if not args.query.strip():
         die("query 不能为空")
+    check_no_running_task(cfg)
     run_task(cfg, args.query, workspace_id=None, resume_token=None,
              manual=args.manual, wait_secs=args.wait or cfg["wait_max"])
 
@@ -290,6 +324,7 @@ def cmd_followup(args):
     if not rt:
         die(f"清单里找不到 workspace_id={args.workspace_id} 的 resume_token；"
             f"请手工传 --resume-token")
+    check_no_running_task(cfg)
     run_task(cfg, args.query, workspace_id=args.workspace_id, resume_token=rt,
              manual=args.manual, wait_secs=args.wait or cfg["wait_max"])
 
@@ -337,6 +372,16 @@ def run_task(cfg, query, workspace_id, resume_token, manual, wait_secs):
     rt_new = resp.get("resume_token") or resume_token
     print(f"[submit] task_id={task_id}  workspace_id={ws_id}")
 
+    # 立即写入占位行到清单，阻塞后续 create/followup（最大并发=1）
+    append_manifest(cfg["apps_file"], {
+        "created_at": _now_iso(),
+        "task_id": task_id,
+        "workspace_id": ws_id,
+        "resume_token": rt_new,
+        "query": query,
+        "status": "submitted",
+    })
+
     try:
         if use_webhook:
             src, payload = _wait_via_webhook(cfg, task_id, box, wait_secs)
@@ -349,32 +394,31 @@ def run_task(cfg, query, workspace_id, resume_token, manual, wait_secs):
     if payload is None:
         eprint(f"[timeout] {wait_secs}s 内未见终态；任务继续运行。"
                f"可稍后执行『使用ddb 状态 {task_id}』查询。")
+        # 标记为 unknown，后续 check_no_running_task 会通过 API 二次确认
+        update_row(cfg["apps_file"], "task_id", task_id, {"status": "unknown"})
         return
 
     fields = extract_terminal(cfg, payload)
-    row = {
-        "created_at": _now_iso(),
-        "task_id": task_id,
-        "workspace_id": ws_id,
-        "resume_token": rt_new,
-        "query": query,
+
+    # 终态成功时铸造 viewer link；owner preview_url 仅登录 owner 可访问。
+    viewer_info = None
+    if fields["preview_url"] and fields["status"] in ("success", "completed"):
+        viewer_info = get_or_mint_viewer_link(cfg, ws_id, label=f"ddb-{fields['project_name'][:40]}")
+
+    patch = {
+        "status": fields["status"],
         "project_name": fields["project_name"],
         "preview_url": fields["preview_url"],
         "screenshot_url": fields["screenshot_url"],
-        "status": fields["status"],
         "final_answer": _clip(fields["final_answer"], 1024),
         "source": src,
     }
+    if viewer_info:
+        patch["viewer_url"] = viewer_info["viewer_url"]
+        if viewer_info.get("viewer_id"):
+            patch["viewer_id"] = viewer_info["viewer_id"]
 
-    # 终态成功时铸造 viewer link；owner preview_url 仅登录 owner 可访问。
-    if fields["preview_url"] and fields["status"] in ("success", "completed"):
-        vl = get_or_mint_viewer_link(cfg, ws_id, label=f"ddb-{fields['project_name'][:40]}")
-        if vl:
-            row["viewer_url"] = vl["viewer_url"]
-            if vl.get("viewer_id"):
-                row["viewer_id"] = vl["viewer_id"]
-
-    append_manifest(cfg["apps_file"], row)
+    update_row(cfg["apps_file"], "task_id", task_id, patch)
 
     print()
     print(f"=== DONE (via {src}) ===")
@@ -384,8 +428,8 @@ def run_task(cfg, query, workspace_id, resume_token, manual, wait_secs):
     print(f"project: {fields['project_name']}")
     print(f"ws     : {ws_id}")
     print(f"task   : {task_id}")
-    if row.get("viewer_url"):
-        print(f"share  : {row['viewer_url']}")
+    if patch.get("viewer_url"):
+        print(f"share  : {patch['viewer_url']}")
     if fields["preview_url"]:
         print(f"owner  : {fields['preview_url']}")
     if fields["screenshot_url"]:
