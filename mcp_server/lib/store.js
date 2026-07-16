@@ -19,8 +19,9 @@ const KEY_FILE = '.deepdiver-key';
 export function loadKey() {
   try {
     return readFileSync(resolve(rootDir(), KEY_FILE), 'utf-8').trim();
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
   }
 }
 
@@ -40,8 +41,9 @@ export function loadTasks() {
   try {
     const raw = readFileSync(resolve(rootDir(), TASKS_FILE), 'utf-8');
     return JSON.parse(raw);
-  } catch {
-    return [];
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw err;
   }
 }
 
@@ -62,8 +64,8 @@ export function addTask(record) {
     workspace_id: record.workspace_id,
     resume_token: record.resume_token,
     prompt: record.prompt,
-    model: record.model || 'ddexp',
-    interaction_mode: record.interaction_mode || 'manual',
+    model: record.model,
+    interaction_mode: record.interaction_mode,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
@@ -85,7 +87,6 @@ export function touchTask(taskId) {
 /** 查找最近一个活跃任务 */
 export function findActiveTask() {
   const tasks = loadTasks();
-  // 返回最近一条
   if (tasks.length === 0) return null;
   return tasks[tasks.length - 1];
 }
