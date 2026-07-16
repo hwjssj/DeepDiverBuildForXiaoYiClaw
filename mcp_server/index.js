@@ -32,8 +32,6 @@ import {
 } from './lib/api.js';
 import { loadKey, saveKey, addTask, touchTask, findActiveTask } from './lib/store.js';
 
-const BASE_URL = process.env.DEEPDIVER_BASE_URL || 'https://cn.deepdiver.app';
-
 // ---- 认证辅助 ----
 
 /** 从文件或环境变量获取 key，未配置时抛错 */
@@ -63,6 +61,8 @@ function formatEventSummary(ev) {
     case 'cancelled': return `⛔ 已取消`;
     case 'paused': return `⏸️ 已暂停`;
     case 'resumed': return `▶️ 已恢复`;
+    case 'streaming': return `📝 流式输出`;
+    case 'subagent_event': return `📎 子 agent 事件: ${ev.data?.event_type || '?'}`;
     default: return `${ev.type}`;
   }
 }
