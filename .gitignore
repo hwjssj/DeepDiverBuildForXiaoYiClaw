@@ -1,4 +1,6 @@
 ._*
 .deepdiver-token
+.deepdiver-key
+.deepdiver-tasks.json
 node_modules/
 .cache/
