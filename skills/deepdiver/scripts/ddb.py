@@ -349,6 +349,7 @@ def run_task(cfg, query, workspace_id, resume_token, manual, wait_secs):
 
     body = {
         "query": query,
+        "model": "ddexp",
         "interaction_mode": interaction_mode,
         "screenshot": True,
     }
