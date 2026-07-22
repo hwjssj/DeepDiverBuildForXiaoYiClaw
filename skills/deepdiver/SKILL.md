@@ -42,6 +42,7 @@ Key 保存在 `~/.deepdiver/auth.json`（权限 600），后续 session 自动�
 - **追问迭代**：`使用ddb 追问 <workspace_id> 在上一个版本基础上加个暗色模式`
 - **查看进度**：`使用ddb 状态 <task_id>`
 - **查看清单**：`使用ddb 列出`
+- **导出清单**：`使用ddb 导出 [--刷新]` — 将所有项目导出为 Markdown 文档，可选 `--刷新` 从 API 拉取最新数据
 
 ### 2.3 等待与交付
 
@@ -76,6 +77,7 @@ Key 保存在 `~/.deepdiver/auth.json`（权限 600），后续 session 自动�
 | 用户输入 | 执行命令 | 模式 |
 |---|---|---|
 | `使用ddb 列出` / `list` | `python3 $RUNNER list` | 同步 |
+| `使用ddb 导出 [--刷新]` | `python3 $RUNNER export [--refresh]` | 同步 |
 | `使用ddb 构建 <描述>` | `python3 $RUNNER create --query "<描述>"` | 长任务 |
 | `使用ddb 追问 <ws_id> <描述>` | `python3 $RUNNER followup --workspace-id <ws_id> --query "<描述>"` | 长任务 |
 | `使用ddb 状态 <task_id>` | `python3 $RUNNER status <task_id>` | 同步 |

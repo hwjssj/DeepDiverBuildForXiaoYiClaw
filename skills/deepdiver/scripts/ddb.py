@@ -538,6 +538,78 @@ def cmd_status(args):
             eprint(f"[manifest] 更新 task_id={args.task_id}")
 
 
+def cmd_export(args):
+    """将本地清单导出为 Markdown 文档（兼容刷新）。"""
+    cfg = load_cfg()
+    rows = read_manifest(cfg["apps_file"])
+    if args.refresh:
+        for r in rows:
+            tid = r.get("task_id")
+            if not tid:
+                continue
+            code, st = api(cfg, "GET", f"/api/v1/tasks/{tid}", timeout=15)
+            if code != 200:
+                continue
+            inner = st.get("result") or {}
+            r["status"] = st.get("status") or r.get("status")
+            if inner.get("preview_url"):
+                r["preview_url"] = inner["preview_url"]
+            if inner.get("project_name"):
+                r["project_name"] = inner["project_name"]
+            shot = screenshot_full(cfg, inner.get("screenshot_url"))
+            if shot:
+                r["screenshot_url"] = shot
+        write_manifest(cfg["apps_file"], rows)
+
+    rows.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+
+    out = [
+        "# DeepDiver 构建项目清单",
+        "",
+        "> 使用 DeepDiver Headless API 构建的 App 汇总",
+        "",
+    ]
+    sym = {"completed": "✅", "failed": "❌", "cancelled": "⛔",
+           "running": "⏳", "waiting_interaction": "❓"}
+    for i, r in enumerate(rows, 1):
+        # 只输出有名字或 viewer_url 的完成项目（跳过空占位行）
+        name = r.get("project_name") or r.get("workspace_id") or "(未命名)"
+        url = r.get("viewer_url") or r.get("preview_url") or ""
+        shot = r.get("screenshot_url") or ""
+        q = (r.get("query") or "").strip()
+        s = r.get("status", "?")
+        ws = r.get("workspace_id", "")
+
+        out.append("---")
+        out.append("")
+        label = f"{i}."
+        out.append(f"## {label} {name}")
+        out.append("")
+        if q:
+            out.append("**完整提示词**")
+            out.append("")
+            for line in q.split("\n"):
+                out.append(f"> {line}")
+            out.append("")
+        out.append("| 字段 | 内容 |")
+        out.append("|------|------|")
+        if url:
+            out.append(f"| **预览链接** | [🌐 打开页面]({url}) |")
+        if shot:
+            out.append(f"| **截图** | ![截图]({shot}) |")
+        out.append(f"| **工作区 ID** | `{ws}` |")
+        out.append(f"| **状态** | {sym.get(s, 'ℹ️')} {s} |")
+        out.append("")
+
+    out.append("---")
+    out.append("")
+    out.append(f"*生成时间：{_now_iso()[:10]}*")
+    out.append("*工具：DeepDiver Headless API*")
+    out.append("")
+
+    print("\n".join(out))
+
+
 def cmd_list(args):
     cfg = load_cfg()
     rows = read_manifest(cfg["apps_file"])
@@ -627,6 +699,9 @@ def cmd_config(args):
 
 
 DESC = {
+    "export": {
+        "help": "ddb export [--refresh]\n         导出所有项目为 Markdown 文档\n         示例: ddb export > DeepDiver-项目清单.md",
+    },
     "list": {
         "help": "ddb list [--refresh]\n         列出本地清单\n         示例: ddb list",
     },
@@ -708,6 +783,10 @@ def build_parser():
     px = sub.add_parser("cancel", help=DESC["cancel"]["help"])
     px.add_argument("task_id")
     px.set_defaults(func=cmd_cancel)
+
+    pe = sub.add_parser("export", help=DESC["export"]["help"])
+    pe.add_argument("--refresh", action="store_true")
+    pe.set_defaults(func=cmd_export)
 
     pcfg = sub.add_parser("config", help=DESC["config"]["help"])
     pcfg.add_argument("--key", required=True, help="DeepDiver API key（格式 sk-hdls-<32hex>）")
